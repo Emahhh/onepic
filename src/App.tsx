@@ -1,5 +1,5 @@
 import type { ChangeEvent } from 'react'
-import { useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import Konva from 'konva'
 import { Layer, Rect, Stage, Image as KonvaImage, Text as KonvaText } from 'react-konva'
 import {
@@ -38,44 +38,151 @@ const EXPORT_WIDTH = 3600
 const DEFAULT_ROW_HEIGHT = 340
 const DEFAULT_GUTTER = 32
 const FOOTER_HEIGHT = 240
+const FRAME_PADDING = 48
+const PREVIEW_MAX_WIDTH = 1400
+const compressionPresets = {
+  crisp: { label: 'Crisp', helper: 'Best detail', quality: 0.95 },
+  balanced: { label: 'Balanced', helper: 'Everyday', quality: 0.85 },
+  compact: { label: 'Compact', helper: 'Smallest file', quality: 0.72 },
+} as const
+type CompressionPreset = keyof typeof compressionPresets
+
+type CanvasSource = HTMLImageElement | HTMLCanvasElement | ImageBitmap
 
 interface PhotoAsset {
   id: string
   name: string
   width: number
   height: number
-  src: string
-  image: HTMLImageElement
+  image: CanvasSource
 }
 
-const readFileAsAsset = (file: File, index: number): Promise<PhotoAsset> =>
-  new Promise((resolve, reject) => {
-    const reader = new FileReader()
+const isBrowser = typeof window !== 'undefined'
+const supportsImageBitmap = isBrowser && 'createImageBitmap' in window
 
-    reader.onerror = () => reject(reader.error ?? new Error('Unable to read file'))
-
-    reader.onload = () => {
-      const dataUrl = reader.result as string
-      const image = new window.Image()
-      image.crossOrigin = 'anonymous'
-
-      image.onload = () => {
-        resolve({
-          id: `${file.name}-${index}-${Date.now()}`,
-          name: file.name,
-          width: image.naturalWidth,
-          height: image.naturalHeight,
-          src: dataUrl,
-          image,
-        })
-      }
-
-      image.onerror = () => reject(new Error(`Unable to load ${file.name}`))
-      image.src = dataUrl
+const loadImageElement = (file: File) =>
+  new Promise<HTMLImageElement>((resolve, reject) => {
+    if (!isBrowser) {
+      reject(new Error('Window context unavailable'))
+      return
     }
 
-    reader.readAsDataURL(file)
+    const url = URL.createObjectURL(file)
+    const image = new window.Image()
+    image.crossOrigin = 'anonymous'
+    image.decoding = 'async'
+
+    image.onload = () => {
+      URL.revokeObjectURL(url)
+      resolve(image)
+    }
+
+    image.onerror = () => {
+      URL.revokeObjectURL(url)
+      reject(new Error(`Unable to load ${file.name}`))
+    }
+
+    image.src = url
   })
+
+const drawToCanvas = (image: HTMLImageElement, width: number, height: number) => {
+  const canvas = document.createElement('canvas')
+  canvas.width = width
+  canvas.height = height
+  const context = canvas.getContext('2d')
+  context?.drawImage(image, 0, 0, width, height)
+  return canvas
+}
+
+const releaseImageSource = (source: CanvasSource | undefined) => {
+  const maybeBitmap = source as ImageBitmap & { close?: () => void }
+  maybeBitmap?.close?.()
+}
+
+const disposeAssets = (collection: PhotoAsset[]) => {
+  collection.forEach((asset) => releaseImageSource(asset.image))
+}
+
+const dataUrlToBytes = (value: string) => {
+  const base64 = value.split(',')[1]
+  if (!base64) {
+    return 0
+  }
+  const padding = (base64.match(/=*$/)?.[0].length ?? 0)
+  return Math.round((base64.length * 3) / 4 - padding)
+}
+
+const formatBytes = (bytes: number) => {
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return '—'
+  }
+  const mb = bytes / (1024 * 1024)
+  return mb >= 1 ? `${mb.toFixed(1)} MB` : `${(bytes / 1024).toFixed(1)} KB`
+}
+
+const readFileAsAsset = async (file: File, index: number): Promise<PhotoAsset> => {
+  const id = `${file.name}-${index}-${Date.now()}`
+
+  if (supportsImageBitmap) {
+    try {
+      const bitmap = await createImageBitmap(file)
+      const scale = Math.min(1, EXPORT_WIDTH / bitmap.width)
+      const targetWidth = Math.round(bitmap.width * scale)
+      const targetHeight = Math.round(bitmap.height * scale)
+
+      if (scale === 1) {
+        return {
+          id,
+          name: file.name,
+          width: targetWidth,
+          height: targetHeight,
+          image: bitmap,
+        }
+      }
+
+      const resized = await createImageBitmap(bitmap, {
+        resizeWidth: targetWidth,
+        resizeHeight: targetHeight,
+        resizeQuality: 'high',
+      })
+      bitmap.close()
+
+      return {
+        id,
+        name: file.name,
+        width: targetWidth,
+        height: targetHeight,
+        image: resized,
+      }
+    } catch (error) {
+      console.warn('Falling back to HTMLImageElement decoding', error)
+    }
+  }
+
+  const image = await loadImageElement(file)
+  const scale = Math.min(1, EXPORT_WIDTH / image.naturalWidth)
+  const targetWidth = Math.round(image.naturalWidth * scale)
+  const targetHeight = Math.round(image.naturalHeight * scale)
+
+  if (scale === 1) {
+    return {
+      id,
+      name: file.name,
+      width: targetWidth,
+      height: targetHeight,
+      image,
+    }
+  }
+
+  const canvas = drawToCanvas(image, targetWidth, targetHeight)
+  return {
+    id,
+    name: file.name,
+    width: targetWidth,
+    height: targetHeight,
+    image: canvas,
+  }
+}
 
 function App() {
   const [assets, setAssets] = useState<PhotoAsset[]>([])
@@ -86,9 +193,32 @@ function App() {
   const [footerEnabled, setFooterEnabled] = useState(true)
   const [footerText, setFooterText] = useState(format(new Date(), 'MMMM d, yyyy'))
   const [snackbar, setSnackbar] = useState<string | null>(null)
+  const [compressionPreset, setCompressionPreset] = useState<CompressionPreset>('balanced')
+  const [estimatedSize, setEstimatedSize] = useState<number | null>(null)
+  const [isEstimating, setIsEstimating] = useState(false)
 
   const { ref: previewRef, size: previewSize } = useResizeObserver<HTMLDivElement>()
   const stageRef = useRef<Konva.Stage>(null)
+  const assetsRef = useRef<PhotoAsset[]>([])
+  const compressionQuality = compressionPresets[compressionPreset].quality
+
+  useEffect(() => {
+    assetsRef.current = assets
+  }, [assets])
+
+  useEffect(() => {
+    return () => {
+      disposeAssets(assetsRef.current)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') {
+      return
+    }
+    Konva.pixelRatio = Math.min(window.devicePixelRatio || 1, 1.5)
+  }, [])
+
 
   const layout = useMemo(() => {
     if (!assets.length) {
@@ -100,8 +230,57 @@ function App() {
       : computeJustifiedLayout(assets, { rowHeight, gutter: DEFAULT_GUTTER, width: EXPORT_WIDTH })
   }, [assets, columns, layoutMode, rowHeight])
 
-  const stageHeight = layout.height + (footerEnabled ? FOOTER_HEIGHT : 0)
-  const previewScale = previewSize.width ? Math.min(1, previewSize.width / EXPORT_WIDTH) : 1
+  const collageHeight = layout.height + (footerEnabled ? FOOTER_HEIGHT : 0)
+  const fullExportWidth = EXPORT_WIDTH + FRAME_PADDING * 2
+  const fullStageHeight = collageHeight + FRAME_PADDING * 2
+  const measuredWidth = previewSize.width ?? PREVIEW_MAX_WIDTH
+  const safeWidth = measuredWidth > 0 ? measuredWidth : PREVIEW_MAX_WIDTH
+  const previewCanvasWidth = Math.min(PREVIEW_MAX_WIDTH, safeWidth, fullExportWidth)
+  const liveScale = previewCanvasWidth / fullExportWidth
+  const previewCanvasHeight = Math.max(fullStageHeight * liveScale, 1)
+  const stageScaleFactor = liveScale > 0 ? 1 / (liveScale * liveScale) : 1
+  const footerOffsetY = FRAME_PADDING + layout.height
+  const frameCornerRadius = footerEnabled ? 64 : 48
+
+  useEffect(() => {
+    if (!stageRef.current || !assets.length || fullStageHeight <= 0) {
+      setEstimatedSize(null)
+      setIsEstimating(false)
+      return
+    }
+
+    let cancelled = false
+    setIsEstimating(true)
+    const timeout = window.setTimeout(() => {
+      if (!stageRef.current || cancelled) {
+        return
+      }
+
+      try {
+        const previewUrl = stageRef.current.toDataURL({ mimeType: 'image/jpeg', quality: compressionQuality })
+        if (cancelled) {
+          return
+        }
+        const previewBytes = dataUrlToBytes(previewUrl)
+        const scaledBytes = previewBytes * stageScaleFactor
+        setEstimatedSize(scaledBytes)
+      } catch (error) {
+        console.warn('Unable to estimate export size', error)
+        if (!cancelled) {
+          setEstimatedSize(null)
+        }
+      } finally {
+        if (!cancelled) {
+          setIsEstimating(false)
+        }
+      }
+    }, 600)
+
+    return () => {
+      cancelled = true
+      window.clearTimeout(timeout)
+    }
+  }, [assets, compressionQuality, stageScaleFactor, liveScale, collageHeight, footerEnabled, footerText, fullStageHeight])
 
   const assetMap = useMemo(() => {
     return assets.reduce<Record<string, PhotoAsset>>((acc, asset) => {
@@ -109,6 +288,7 @@ function App() {
       return acc
     }, {})
   }, [assets])
+  const estimatedSizeLabel = isEstimating ? 'Estimating…' : estimatedSize ? formatBytes(estimatedSize) : '—'
 
   const handleFiles = async (event: ChangeEvent<HTMLInputElement>) => {
     const fileList = event.target.files
@@ -124,6 +304,7 @@ function App() {
     setIsProcessing(true)
     try {
       const loaded = await Promise.all(selected.map((file, index) => readFileAsAsset(file, index)))
+      disposeAssets(assetsRef.current)
       setAssets(loaded)
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unable to process images'
@@ -140,7 +321,20 @@ function App() {
       return
     }
 
-    const dataUrl = stageRef.current.toDataURL({ mimeType: 'image/jpeg', quality: 0.95 })
+    const stage = stageRef.current
+    const previousScale = stage.scale()
+    const previousSize = stage.size()
+
+    stage.scale({ x: 1, y: 1 })
+    stage.size({ width: fullExportWidth, height: fullStageHeight })
+    stage.batchDraw()
+
+    const dataUrl = stage.toDataURL({ mimeType: 'image/jpeg', quality: compressionQuality })
+
+    stage.scale(previousScale)
+    stage.size(previousSize)
+    stage.batchDraw()
+
     const link = document.createElement('a')
     link.href = dataUrl
     link.download = `daily-recap-${Date.now()}.jpg`
@@ -148,6 +342,9 @@ function App() {
   }
 
   const resetState = () => {
+    if (assetsRef.current.length) {
+      disposeAssets(assetsRef.current)
+    }
     setAssets([])
     setSnackbar('Canvas cleared. Ready for a new recap!')
   }
@@ -289,20 +486,54 @@ function App() {
                     InputProps={{ sx: { color: '#f7f7fb' } }}
                   />
                 </Stack>
+                <Divider flexItem orientation="vertical" sx={{ display: { xs: 'none', md: 'block' } }} />
+                <Stack spacing={1} flex={1}>
+                  <Typography variant="overline" color="rgba(247,247,251,0.72)">
+                    Compression
+                  </Typography>
+                  <ToggleButtonGroup
+                    exclusive
+                    size="small"
+                    value={compressionPreset}
+                    color="secondary"
+                    onChange={(_event, value: CompressionPreset | null) => {
+                      if (value) {
+                        setCompressionPreset(value)
+                      }
+                    }}
+                  >
+                    {Object.entries(compressionPresets).map(([key, option]) => (
+                      <ToggleButton key={key} value={key}>
+                        {option.label}
+                      </ToggleButton>
+                    ))}
+                  </ToggleButtonGroup>
+                  <Typography variant="caption" color="rgba(247,247,251,0.6)">
+                    Quality {Math.round(compressionQuality * 100)}% · {compressionPresets[compressionPreset].helper}
+                  </Typography>
+                </Stack>
               </Stack>
             </Paper>
 
             <Stack direction={{ xs: 'column', md: 'row' }} spacing={2} alignItems="center">
               <Chip label={`${assets.length} photo${assets.length === 1 ? '' : 's'}`} color="secondary" />
-              <Chip label={`Export: ${EXPORT_WIDTH.toLocaleString()}px wide`} variant="outlined" />
+              <Chip label={`Export: ${fullExportWidth.toLocaleString()}px wide`} variant="outlined" />
               {assets.length > 0 && (
                 <Chip
                   variant="outlined"
-                  label={`Approx height: ${Math.round(stageHeight)}px`}
+                  label={`Approx height: ${Math.round(fullStageHeight)}px`}
                   icon={<InfoOutlinedIcon />}
                 />
               )}
               <Box sx={{ flexGrow: 1 }} />
+              <Stack spacing={0.5} alignItems={{ xs: 'flex-start', md: 'flex-end' }}>
+                <Typography variant="caption" color="rgba(247,247,251,0.72)">
+                  Estimated size: {estimatedSizeLabel}
+                </Typography>
+                <Typography variant="caption" color="rgba(247,247,251,0.6)">
+                  JPEG quality {Math.round(compressionQuality * 100)}%
+                </Typography>
+              </Stack>
               <Button
                 variant="contained"
                 color="secondary"
@@ -339,29 +570,49 @@ function App() {
               ) : (
                 <Box
                   sx={{
-                    width: EXPORT_WIDTH,
-                    transform: `scale(${previewScale})`,
-                    transformOrigin: 'top left',
+                    width: previewCanvasWidth,
                     boxShadow: '0 40px 120px rgba(0,0,0,0.45)',
                     backgroundColor: '#fff',
                     borderRadius: footerEnabled ? '32px 32px 40px 40px' : '32px',
+                    mx: 'auto',
                   }}
                 >
-                  {/* Stage stays at export resolution so downloads are lossless; the wrapper handles scaling. */}
-                  <Stage ref={stageRef} width={EXPORT_WIDTH} height={stageHeight}>
-                    <Layer>
+                  {/* Stage renders at a scaled size for interactivity but exports at full resolution. */}
+                  <Stage
+                    ref={stageRef}
+                    width={previewCanvasWidth}
+                    height={previewCanvasHeight}
+                    scaleX={liveScale}
+                    scaleY={liveScale}
+                  >
+                    <Layer listening={false} perfectDrawEnabled={false}>
+                      <Rect
+                        x={0}
+                        y={0}
+                        width={fullExportWidth}
+                        height={fullStageHeight}
+                        fill="#fefcf5"
+                        stroke="rgba(12,12,16,0.08)"
+                        strokeWidth={8}
+                        cornerRadius={frameCornerRadius}
+                        shadowColor="rgba(0,0,0,0.18)"
+                        shadowBlur={120}
+                        shadowOffsetY={24}
+                      />
+                    </Layer>
+                    <Layer listening={false} perfectDrawEnabled={false}>
                       {layout.items.map((item) => {
                         const asset = assetMap[item.id]
                         if (!asset) {
                           return null
                         }
-                        // KonvaImage draws the preloaded HTMLImageElement directly onto the canvas layer.
+                        // KonvaImage draws the pre-decoded bitmap/canvas directly onto the canvas layer.
                         return (
                           <KonvaImage
                             key={item.id}
                             image={asset.image}
-                            x={item.x}
-                            y={item.y}
+                            x={item.x + FRAME_PADDING}
+                            y={item.y + FRAME_PADDING}
                             width={item.width}
                             height={item.height}
                             listening={false}
@@ -373,11 +624,11 @@ function App() {
                       })}
                     </Layer>
                     {footerEnabled && (
-                      <Layer>
+                      <Layer listening={false} perfectDrawEnabled={false}>
                         {/* Dedicated footer layer renders after photos so it overlays edge shadows cleanly. */}
                         <Rect
-                          x={0}
-                          y={layout.height}
+                          x={FRAME_PADDING}
+                          y={footerOffsetY}
                           width={EXPORT_WIDTH}
                           height={FOOTER_HEIGHT}
                           fill="#fff"
@@ -386,8 +637,8 @@ function App() {
                         />
                         <KonvaText
                           text={footerText || 'Daily Recap'}
-                          x={0}
-                          y={layout.height + FOOTER_HEIGHT / 2 - 32}
+                          x={FRAME_PADDING}
+                          y={footerOffsetY + FOOTER_HEIGHT / 2 - 32}
                           width={EXPORT_WIDTH}
                           align="center"
                           fontSize={72}
