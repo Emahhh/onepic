@@ -1,6 +1,6 @@
-# Daily Recap
+# OnePic
 
-Daily Recap is a client-only React SPA that stitches up to 100 original photos into a single, high-resolution collage. Users can switch between masonry and justified algorithms, toggle an optional polaroid footer, and export the final canvas as a crisp JPEG—no backend required.
+OnePic is a client-only React SPA that stitches up to 100 original photos into a single, high-resolution collage. Users can switch between masonry and justified algorithms, toggle an optional polaroid footer, and export the final canvas as a crisp JPEG—no backend required.
 
 ## Tech Stack
 

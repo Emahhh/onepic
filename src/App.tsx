@@ -1,4 +1,4 @@
-import type { ChangeEvent } from 'react'
+import type { ChangeEvent, DragEvent } from 'react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import Konva from 'konva'
 import { Layer, Rect, Stage, Image as KonvaImage, Text as KonvaText } from 'react-konva'
@@ -24,7 +24,7 @@ import {
   Tooltip,
   Typography,
 } from '@mui/material'
-import UploadRoundedIcon from '@mui/icons-material/UploadRounded'
+import AddPhotoAlternateRoundedIcon from '@mui/icons-material/AddPhotoAlternateRounded'
 import DownloadRoundedIcon from '@mui/icons-material/DownloadRounded'
 import RestartAltRoundedIcon from '@mui/icons-material/RestartAltRounded'
 import InfoOutlinedIcon from '@mui/icons-material/InfoOutlined'
@@ -196,10 +196,12 @@ function App() {
   const [compressionPreset, setCompressionPreset] = useState<CompressionPreset>('balanced')
   const [estimatedSize, setEstimatedSize] = useState<number | null>(null)
   const [isEstimating, setIsEstimating] = useState(false)
+  const [isDragOver, setIsDragOver] = useState(false)
 
   const { ref: previewRef, size: previewSize } = useResizeObserver<HTMLDivElement>()
   const stageRef = useRef<Konva.Stage>(null)
   const assetsRef = useRef<PhotoAsset[]>([])
+  const dragCounterRef = useRef(0)
   const compressionQuality = compressionPresets[compressionPreset].quality
 
   useEffect(() => {
@@ -240,7 +242,6 @@ function App() {
   const previewCanvasHeight = Math.max(fullStageHeight * liveScale, 1)
   const stageScaleFactor = liveScale > 0 ? 1 / (liveScale * liveScale) : 1
   const footerOffsetY = FRAME_PADDING + layout.height
-  const frameCornerRadius = footerEnabled ? 64 : 48
 
   useEffect(() => {
     if (!stageRef.current || !assets.length || fullStageHeight <= 0) {
@@ -282,22 +283,54 @@ function App() {
     }
   }, [assets, compressionQuality, stageScaleFactor, liveScale, collageHeight, footerEnabled, footerText, fullStageHeight])
 
-  const assetMap = useMemo(() => {
-    return assets.reduce<Record<string, PhotoAsset>>((acc, asset) => {
-      acc[asset.id] = asset
-      return acc
-    }, {})
-  }, [assets])
-  const estimatedSizeLabel = isEstimating ? 'Estimating…' : estimatedSize ? formatBytes(estimatedSize) : '—'
+    const assetMap = useMemo(() => {
+      return assets.reduce<Record<string, PhotoAsset>>((acc, asset) => {
+        acc[asset.id] = asset
+        return acc
+      }, {})
+    }, [assets])
+    const estimatedSizeLabel = isEstimating ? 'Estimating…' : estimatedSize ? formatBytes(estimatedSize) : '—'
+    const hasAssets = assets.length > 0
 
-  const handleFiles = async (event: ChangeEvent<HTMLInputElement>) => {
-    const fileList = event.target.files
-    if (!fileList?.length) {
+    const renderPrivacyNote = (alignment: 'left' | 'right' | 'center' = 'left') => (
+      <Typography
+        variant="caption"
+        color="rgba(247,247,251,0.72)"
+        sx={{ textAlign: alignment, maxWidth: 320 }}
+      >
+        Photos stay on this device—nothing is uploaded or sent anywhere.
+      </Typography>
+    )
+
+    const renderDropHint = (alignment: 'left' | 'right' | 'center' = 'left') => (
+      <Typography
+        variant="body2"
+        color="rgba(247,247,251,0.85)"
+        sx={{ textAlign: alignment, maxWidth: 360 }}
+      >
+        or drag and drop images here
+      </Typography>
+    )
+
+    const renderSelectPhotosButton = () => (
+      <Button
+        component="label"
+        variant="contained"
+        color="primary"
+        startIcon={<AddPhotoAlternateRoundedIcon />}
+      >
+        Select Photos
+        <input hidden accept="image/*" multiple type="file" onChange={handleFiles} />
+      </Button>
+    )
+
+  const processFiles = async (incoming: File[]) => {
+    if (!incoming.length) {
       return
     }
 
-    const selected = Array.from(fileList).slice(0, MAX_IMAGES)
-    if (fileList.length > MAX_IMAGES) {
+    const selected = incoming.slice(0, MAX_IMAGES)
+    if (incoming.length > MAX_IMAGES) {
       setSnackbar(`Only the first ${MAX_IMAGES} images were queued.`)
     }
 
@@ -311,13 +344,51 @@ function App() {
       setSnackbar(message)
     } finally {
       setIsProcessing(false)
-      event.target.value = ''
     }
+  }
+
+  const handleFiles = async (event: ChangeEvent<HTMLInputElement>) => {
+    const fileList = event.target.files
+    await processFiles(fileList ? Array.from(fileList) : [])
+    event.target.value = ''
+  }
+
+  const handleDragEnter = (event: DragEvent<HTMLDivElement>) => {
+    event.preventDefault()
+    event.stopPropagation()
+    dragCounterRef.current += 1
+    if (!isDragOver) {
+      setIsDragOver(true)
+    }
+  }
+
+  const handleDragLeave = (event: DragEvent<HTMLDivElement>) => {
+    event.preventDefault()
+    event.stopPropagation()
+    dragCounterRef.current = Math.max(0, dragCounterRef.current - 1)
+    if (dragCounterRef.current === 0) {
+      setIsDragOver(false)
+    }
+  }
+
+  const handleDragOver = (event: DragEvent<HTMLDivElement>) => {
+    event.preventDefault()
+    event.stopPropagation()
+  }
+
+  const handleDrop = async (event: DragEvent<HTMLDivElement>) => {
+    event.preventDefault()
+    event.stopPropagation()
+    dragCounterRef.current = 0
+    setIsDragOver(false)
+    const files = event.dataTransfer?.files
+    await processFiles(files ? Array.from(files) : [])
+    event.dataTransfer?.clearData()
   }
 
   const handleDownload = () => {
     if (!stageRef.current || !assets.length) {
-      setSnackbar('Upload photos before exporting your recap.')
+      setSnackbar('Add photos before exporting your recap.')
       return
     }
 
@@ -337,7 +408,7 @@ function App() {
 
     const link = document.createElement('a')
     link.href = dataUrl
-    link.download = `daily-recap-${Date.now()}.jpg`
+    link.download = `onepic-${format(new Date(), 'yyyy-MM-dd')}.jpg`
     link.click()
   }
 
@@ -362,295 +433,320 @@ function App() {
       <Container maxWidth="lg">
         <Paper
           elevation={0}
+          onDragEnter={handleDragEnter}
+          onDragLeave={handleDragLeave}
+          onDragOver={handleDragOver}
+          onDrop={handleDrop}
           sx={{
             borderRadius: 4,
             backdropFilter: 'blur(20px)',
             background: 'rgba(8, 10, 14, 0.75)',
-            border: '1px solid rgba(255,255,255,0.08)',
+            border: isDragOver ? '1px solid rgba(144,202,249,0.9)' : '1px solid rgba(255,255,255,0.08)',
+            boxShadow: isDragOver ? '0 0 0 1px rgba(144,202,249,0.4)' : undefined,
+            transition: 'border-color 0.2s ease, box-shadow 0.2s ease',
             p: { xs: 3, md: 4 },
             color: '#f7f7fb',
+            position: 'relative',
+            overflow: 'hidden',
           }}
         >
+          {isDragOver && (
+            <Box
+              sx={{
+                position: 'absolute',
+                inset: 8,
+                borderRadius: 3,
+                border: '1px dashed rgba(144,202,249,0.9)',
+                background: 'rgba(13, 71, 161, 0.18)',
+                color: '#e3f2fd',
+                fontWeight: 600,
+                letterSpacing: 1,
+                textTransform: 'uppercase',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                pointerEvents: 'none',
+              }}
+            >
+              Drop photos to add them
+            </Box>
+          )}
           <Stack spacing={3}>
-            <Stack direction={{ xs: 'column', md: 'row' }} spacing={2} justifyContent="space-between">
-              <Box>
-                <Typography variant="h3" fontWeight={600} gutterBottom>
-                  Daily Recap
+            {hasAssets ? (
+              <Stack direction={{ xs: 'column', md: 'row' }} spacing={2} justifyContent="space-between">
+                <Box>
+                  <Typography variant="h3" fontWeight={600} gutterBottom>
+                    OnePic
+                  </Typography>
+                  <Typography variant="body1" color="rgba(247,247,251,0.72)">
+                    Select up to 100 photos, experiment with layouts, and export a single collage.
+                  </Typography>
+                </Box>
+                <Stack spacing={1} alignItems={{ xs: 'flex-start', md: 'flex-end' }}>
+                  <Stack direction="row" spacing={1} justifyContent="flex-end">
+                    {renderSelectPhotosButton()}
+                    <Tooltip title="Clear canvas">
+                      <span>
+                        <IconButton color="inherit" disabled={!assets.length} onClick={resetState}>
+                          <RestartAltRoundedIcon />
+                        </IconButton>
+                      </span>
+                    </Tooltip>
+                  </Stack>
+                  {renderPrivacyNote('right')}
+                  {renderDropHint('right')}
+                </Stack>
+              </Stack>
+            ) : (
+              <Stack spacing={2} alignItems="center" textAlign="center">
+                <Typography variant="h3" fontWeight={600}>
+                  OnePic
                 </Typography>
                 <Typography variant="body1" color="rgba(247,247,251,0.72)">
-                  Upload up to 100 photos, experiment with smart layouts, and export a single archival
-                  collage.
+                  Select up to 100 photos and turn them into a single beautiful collage with your memories. All in one pic.
                 </Typography>
-              </Box>
-              <Stack direction="row" spacing={1} justifyContent="flex-end">
-                <Button
-                  component="label"
-                  variant="contained"
-                  color="primary"
-                  startIcon={<UploadRoundedIcon />}
-                >
-                  Upload Photos
-                  <input hidden accept="image/*" multiple type="file" onChange={handleFiles} />
-                </Button>
-                <Tooltip title="Clear canvas">
-                  <span>
-                    <IconButton color="inherit" disabled={!assets.length} onClick={resetState}>
-                      <RestartAltRoundedIcon />
-                    </IconButton>
-                  </span>
-                </Tooltip>
+                {renderSelectPhotosButton()}
+                {renderDropHint('center')}
+                {renderPrivacyNote('center')}
               </Stack>
-            </Stack>
+            )}
 
             {isProcessing && <LinearProgress color="info" />}
 
-            <Paper
-              elevation={0}
-              sx={{
-                p: 3,
-                borderRadius: 3,
-                background: 'rgba(255,255,255,0.05)',
-                border: '1px solid rgba(255,255,255,0.08)',
-              }}
-            >
-              <Stack spacing={3} direction={{ xs: 'column', md: 'row' }}>
-                <Stack spacing={1} flex={1}>
-                  <Typography variant="overline" color="rgba(247,247,251,0.72)">
-                    Layout
-                  </Typography>
-                  <ToggleButtonGroup
-                    exclusive
-                    size="small"
-                    color="primary"
-                    value={layoutMode}
-                    onChange={(_event, value: LayoutMode | null) => {
-                      if (value) {
-                        setLayoutMode(value)
-                      }
-                    }}
-                  >
-                    <ToggleButton value="masonry">Masonry</ToggleButton>
-                    <ToggleButton value="justified">Justified</ToggleButton>
-                  </ToggleButtonGroup>
-                  {layoutMode === 'masonry' ? (
-                    <Box>
-                      <Typography variant="caption" color="rgba(247,247,251,0.6)">
-                        Columns: {columns}
-                      </Typography>
-                      <Slider
-                        value={columns}
-                        min={2}
-                        max={6}
-                        step={1}
-                        marks
-                        onChange={(_event, value) => setColumns(value as number)}
-                      />
-                    </Box>
-                  ) : (
-                    <Box>
-                      <Typography variant="caption" color="rgba(247,247,251,0.6)">
-                        Target row height: {rowHeight}px
-                      </Typography>
-                      <Slider
-                        value={rowHeight}
-                        min={220}
-                        max={480}
-                        step={20}
-                        marks
-                        onChange={(_event, value) => setRowHeight(value as number)}
-                      />
-                    </Box>
-                  )}
-                </Stack>
-                <Divider flexItem orientation="vertical" sx={{ display: { xs: 'none', md: 'block' } }} />
-                <Stack spacing={1} flex={1}>
-                  <Typography variant="overline" color="rgba(247,247,251,0.72)">
-                    Polaroid footer
-                  </Typography>
-                  <FormControlLabel
-                    control={
-                      <Switch
-                        checked={footerEnabled}
-                        onChange={(_event, checked) => setFooterEnabled(checked)}
-                        color="secondary"
-                      />
-                    }
-                    label={footerEnabled ? 'Footer enabled' : 'Footer hidden'}
-                  />
-                  <TextField
-                    label="Footer text"
-                    placeholder="Add a title or date"
-                    disabled={!footerEnabled}
-                    value={footerText}
-                    onChange={(event) => setFooterText(event.target.value)}
-                    InputProps={{ sx: { color: '#f7f7fb' } }}
-                  />
-                </Stack>
-                <Divider flexItem orientation="vertical" sx={{ display: { xs: 'none', md: 'block' } }} />
-                <Stack spacing={1} flex={1}>
-                  <Typography variant="overline" color="rgba(247,247,251,0.72)">
-                    Compression
-                  </Typography>
-                  <ToggleButtonGroup
-                    exclusive
-                    size="small"
-                    value={compressionPreset}
-                    color="secondary"
-                    onChange={(_event, value: CompressionPreset | null) => {
-                      if (value) {
-                        setCompressionPreset(value)
-                      }
-                    }}
-                  >
-                    {Object.entries(compressionPresets).map(([key, option]) => (
-                      <ToggleButton key={key} value={key}>
-                        {option.label}
-                      </ToggleButton>
-                    ))}
-                  </ToggleButtonGroup>
-                  <Typography variant="caption" color="rgba(247,247,251,0.6)">
-                    Quality {Math.round(compressionQuality * 100)}% · {compressionPresets[compressionPreset].helper}
-                  </Typography>
-                </Stack>
-              </Stack>
-            </Paper>
-
-            <Stack direction={{ xs: 'column', md: 'row' }} spacing={2} alignItems="center">
-              <Chip label={`${assets.length} photo${assets.length === 1 ? '' : 's'}`} color="secondary" />
-              <Chip label={`Export: ${fullExportWidth.toLocaleString()}px wide`} variant="outlined" />
-              {assets.length > 0 && (
-                <Chip
-                  variant="outlined"
-                  label={`Approx height: ${Math.round(fullStageHeight)}px`}
-                  icon={<InfoOutlinedIcon />}
-                />
-              )}
-              <Box sx={{ flexGrow: 1 }} />
-              <Stack spacing={0.5} alignItems={{ xs: 'flex-start', md: 'flex-end' }}>
-                <Typography variant="caption" color="rgba(247,247,251,0.72)">
-                  Estimated size: {estimatedSizeLabel}
-                </Typography>
-                <Typography variant="caption" color="rgba(247,247,251,0.6)">
-                  JPEG quality {Math.round(compressionQuality * 100)}%
-                </Typography>
-              </Stack>
-              <Button
-                variant="contained"
-                color="secondary"
-                disabled={!assets.length}
-                startIcon={<DownloadRoundedIcon />}
-                onClick={handleDownload}
-              >
-                Download JPEG
-              </Button>
-            </Stack>
-
-            <Box
-              ref={previewRef}
-              sx={{
-                width: '100%',
-                overflowX: 'auto',
-                borderRadius: 3,
-                border: '1px dashed rgba(255,255,255,0.24)',
-                background: 'rgba(5,6,10,0.65)',
-                p: 2,
-              }}
-            >
-              {assets.length === 0 ? (
-                <Stack
-                  minHeight={240}
-                  alignItems="center"
-                  justifyContent="center"
-                  spacing={1}
-                  color="rgba(247,247,251,0.6)"
-                >
-                  <Typography variant="h6">Drop your photos to preview the collage.</Typography>
-                  <Typography variant="body2">High-resolution export stays crisp even when preview is scaled.</Typography>
-                </Stack>
-              ) : (
-                <Box
+            {hasAssets && (
+              <>
+                <Paper
+                  elevation={0}
                   sx={{
-                    width: previewCanvasWidth,
-                    boxShadow: '0 40px 120px rgba(0,0,0,0.45)',
-                    backgroundColor: '#fff',
-                    borderRadius: footerEnabled ? '32px 32px 40px 40px' : '32px',
-                    mx: 'auto',
+                    p: 3,
+                    borderRadius: 3,
+                    background: 'rgba(255,255,255,0.05)',
+                    border: '1px solid rgba(255,255,255,0.08)',
                   }}
                 >
-                  {/* Stage renders at a scaled size for interactivity but exports at full resolution. */}
-                  <Stage
-                    ref={stageRef}
-                    width={previewCanvasWidth}
-                    height={previewCanvasHeight}
-                    scaleX={liveScale}
-                    scaleY={liveScale}
-                  >
-                    <Layer listening={false} perfectDrawEnabled={false}>
-                      <Rect
-                        x={0}
-                        y={0}
-                        width={fullExportWidth}
-                        height={fullStageHeight}
-                        fill="#fefcf5"
-                        stroke="rgba(12,12,16,0.08)"
-                        strokeWidth={8}
-                        cornerRadius={frameCornerRadius}
-                        shadowColor="rgba(0,0,0,0.18)"
-                        shadowBlur={120}
-                        shadowOffsetY={24}
-                      />
-                    </Layer>
-                    <Layer listening={false} perfectDrawEnabled={false}>
-                      {layout.items.map((item) => {
-                        const asset = assetMap[item.id]
-                        if (!asset) {
-                          return null
-                        }
-                        // KonvaImage draws the pre-decoded bitmap/canvas directly onto the canvas layer.
-                        return (
-                          <KonvaImage
-                            key={item.id}
-                            image={asset.image}
-                            x={item.x + FRAME_PADDING}
-                            y={item.y + FRAME_PADDING}
-                            width={item.width}
-                            height={item.height}
-                            listening={false}
-                            shadowColor="rgba(0,0,0,0.25)"
-                            shadowBlur={30}
-                            cornerRadius={24}
+                  <Stack spacing={3} direction={{ xs: 'column', md: 'row' }}>
+                    <Stack spacing={1} flex={1}>
+                      <Typography variant="overline" color="rgba(247,247,251,0.72)">
+                        Layout
+                      </Typography>
+                      <ToggleButtonGroup
+                        exclusive
+                        size="small"
+                        color="primary"
+                        value={layoutMode}
+                        onChange={(_event, value: LayoutMode | null) => {
+                          if (value) {
+                            setLayoutMode(value)
+                          }
+                        }}
+                      >
+                        <ToggleButton value="masonry">Masonry</ToggleButton>
+                        <ToggleButton value="justified">Justified</ToggleButton>
+                      </ToggleButtonGroup>
+                      {layoutMode === 'masonry' ? (
+                        <Box>
+                          <Typography variant="caption" color="rgba(247,247,251,0.6)">
+                            Columns: {columns}
+                          </Typography>
+                          <Slider
+                            value={columns}
+                            min={2}
+                            max={6}
+                            step={1}
+                            marks
+                            onChange={(_event, value) => setColumns(value as number)}
                           />
-                        )
-                      })}
-                    </Layer>
-                    {footerEnabled && (
+                        </Box>
+                      ) : (
+                        <Box>
+                          <Typography variant="caption" color="rgba(247,247,251,0.6)">
+                            Target row height: {rowHeight}px
+                          </Typography>
+                          <Slider
+                            value={rowHeight}
+                            min={220}
+                            max={480}
+                            step={20}
+                            marks
+                            onChange={(_event, value) => setRowHeight(value as number)}
+                          />
+                        </Box>
+                      )}
+                    </Stack>
+                    <Divider flexItem orientation="vertical" sx={{ display: { xs: 'none', md: 'block' } }} />
+                    <Stack spacing={1} flex={1}>
+                      <Typography variant="overline" color="rgba(247,247,251,0.72)">
+                        Polaroid footer
+                      </Typography>
+                      <FormControlLabel
+                        control={
+                          <Switch
+                            checked={footerEnabled}
+                            onChange={(_event, checked) => setFooterEnabled(checked)}
+                            color="secondary"
+                          />
+                        }
+                        label={footerEnabled ? 'Footer enabled' : 'Footer hidden'}
+                      />
+                      <TextField
+                        label="Footer text"
+                        placeholder="Add a title or date"
+                        disabled={!footerEnabled}
+                        value={footerText}
+                        onChange={(event) => setFooterText(event.target.value)}
+                        InputProps={{ sx: { color: '#f7f7fb' } }}
+                      />
+                    </Stack>
+                    <Divider flexItem orientation="vertical" sx={{ display: { xs: 'none', md: 'block' } }} />
+                    <Stack spacing={1} flex={1}>
+                      <Typography variant="overline" color="rgba(247,247,251,0.72)">
+                        Compression
+                      </Typography>
+                      <ToggleButtonGroup
+                        exclusive
+                        size="small"
+                        value={compressionPreset}
+                        color="secondary"
+                        onChange={(_event, value: CompressionPreset | null) => {
+                          if (value) {
+                            setCompressionPreset(value)
+                          }
+                        }}
+                      >
+                        {Object.entries(compressionPresets).map(([key, option]) => (
+                          <ToggleButton key={key} value={key}>
+                            {option.label}
+                          </ToggleButton>
+                        ))}
+                      </ToggleButtonGroup>
+                      <Typography variant="caption" color="rgba(247,247,251,0.6)">
+                        Quality {Math.round(compressionQuality * 100)}% · {compressionPresets[compressionPreset].helper}
+                      </Typography>
+                    </Stack>
+                  </Stack>
+                </Paper>
+
+                <Stack direction={{ xs: 'column', md: 'row' }} spacing={2} alignItems="center">
+                  <Chip label={`${assets.length} photo${assets.length === 1 ? '' : 's'}`} color="secondary" />
+                  <Chip label={`Export: ${fullExportWidth.toLocaleString()}px wide`} variant="outlined" />
+                  {assets.length > 0 && (
+                    <Chip
+                      variant="outlined"
+                      label={`Approx height: ${Math.round(fullStageHeight)}px`}
+                      icon={<InfoOutlinedIcon />}
+                    />
+                  )}
+                  <Box sx={{ flexGrow: 1 }} />
+                  <Stack spacing={0.5} alignItems={{ xs: 'flex-start', md: 'flex-end' }}>
+                    <Typography variant="caption" color="rgba(247,247,251,0.72)">
+                      Estimated size: {estimatedSizeLabel}
+                    </Typography>
+                    <Typography variant="caption" color="rgba(247,247,251,0.6)">
+                      JPEG quality {Math.round(compressionQuality * 100)}%
+                    </Typography>
+                  </Stack>
+                  <Button
+                    variant="contained"
+                    color="secondary"
+                    disabled={!assets.length}
+                    startIcon={<DownloadRoundedIcon />}
+                    onClick={handleDownload}
+                  >
+                    Download JPEG
+                  </Button>
+                </Stack>
+
+                <Box
+                  ref={previewRef}
+                  sx={{
+                    width: '100%',
+                    overflowX: 'auto',
+                    borderRadius: 3,
+                    border: '1px dashed rgba(255,255,255,0.24)',
+                    background: 'rgba(5,6,10,0.65)',
+                    p: 2,
+                  }}
+                >
+                  <Box
+                    sx={{
+                      width: previewCanvasWidth,
+                      boxShadow: '0 40px 120px rgba(0,0,0,0.45)',
+                      backgroundColor: '#fff',
+                      borderRadius: 0,
+                      mx: 'auto',
+                    }}
+                  >
+                    {/* Stage renders at a scaled size for interactivity but exports at full resolution. */}
+                    <Stage
+                      ref={stageRef}
+                      width={previewCanvasWidth}
+                      height={previewCanvasHeight}
+                      scaleX={liveScale}
+                      scaleY={liveScale}
+                    >
                       <Layer listening={false} perfectDrawEnabled={false}>
-                        {/* Dedicated footer layer renders after photos so it overlays edge shadows cleanly. */}
                         <Rect
-                          x={FRAME_PADDING}
-                          y={footerOffsetY}
-                          width={EXPORT_WIDTH}
-                          height={FOOTER_HEIGHT}
-                          fill="#fff"
-                          shadowColor="rgba(12,12,16,0.4)"
-                          shadowBlur={60}
-                        />
-                        <KonvaText
-                          text={footerText || 'Daily Recap'}
-                          x={FRAME_PADDING}
-                          y={footerOffsetY + FOOTER_HEIGHT / 2 - 32}
-                          width={EXPORT_WIDTH}
-                          align="center"
-                          fontSize={72}
-                          fontFamily='"Space Grotesk Variable", "Space Grotesk", sans-serif'
-                          fill="#05060a"
+                          x={0}
+                          y={0}
+                          width={fullExportWidth}
+                          height={fullStageHeight}
+                          fill="#ffffffff"
+                          stroke="rgba(12,12,16,0.08)"
+                          strokeWidth={8}
+                          shadowColor="rgba(0,0,0,0.18)"
+                          shadowBlur={120}
+                          shadowOffsetY={24}
                         />
                       </Layer>
-                    )}
-                  </Stage>
+                      <Layer listening={false} perfectDrawEnabled={false}>
+                        {layout.items.map((item) => {
+                          const asset = assetMap[item.id]
+                          if (!asset) {
+                            return null
+                          }
+                          // KonvaImage draws the pre-decoded bitmap/canvas directly onto the canvas layer.
+                          return (
+                            <KonvaImage
+                              key={item.id}
+                              image={asset.image}
+                              x={item.x + FRAME_PADDING}
+                              y={item.y + FRAME_PADDING}
+                              width={item.width}
+                              height={item.height}
+                              listening={false}
+                              shadowColor="rgba(0,0,0,0.25)"
+                              shadowBlur={30}
+                            />
+                          )
+                        })}
+                      </Layer>
+                      {footerEnabled && (
+                        <Layer listening={false} perfectDrawEnabled={false}>
+                          {/* Dedicated footer layer renders after photos so it overlays edge shadows cleanly. */}
+                          <Rect
+                            x={FRAME_PADDING}
+                            y={footerOffsetY}
+                            width={EXPORT_WIDTH}
+                            height={FOOTER_HEIGHT}
+                            fill="#fff"
+                          />
+                          <KonvaText
+                            text={footerText || 'OnePic'}
+                            x={FRAME_PADDING}
+                            y={footerOffsetY + FOOTER_HEIGHT / 2 - 32}
+                            width={EXPORT_WIDTH}
+                            align="center"
+                            fontSize={72}
+                            fontFamily='"Space Grotesk Variable", "Space Grotesk", sans-serif'
+                            fill="#05060a"
+                          />
+                        </Layer>
+                      )}
+                    </Stage>
+                  </Box>
                 </Box>
-              )}
-            </Box>
+              </>
+            )}
           </Stack>
         </Paper>
       </Container>
