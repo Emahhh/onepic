@@ -7,11 +7,9 @@ import {
   Backdrop,
   Box,
   Button,
-  Chip,
   Container,
   Divider,
   Fab,
-  FormControlLabel,
   IconButton,
   LinearProgress,
   Link,
@@ -42,14 +40,17 @@ const debounce = <T extends (...args: any[]) => any>(fn: T, delay: number) => {
   }) as T
 }
 
-const MAX_IMAGES = 100
+const MAX_IMAGES_DESKTOP = 100
+const MAX_IMAGES_MOBILE = 50
 const EXPORT_WIDTH = 3600
+const IMPORT_WIDTH_MOBILE = 1800 // Smaller images on mobile to save memory
 const DEFAULT_ROW_HEIGHT = 340
 const DEFAULT_GUTTER = 32
 const FOOTER_HEIGHT = 240
 const FRAME_PADDING = 48
 const PREVIEW_MAX_WIDTH = 600
-const BATCH_SIZE = 8
+const BATCH_SIZE_DESKTOP = 8
+const BATCH_SIZE_MOBILE = 3 // Smaller batches on mobile
 const compressionPresets = {
   crisp: { label: 'Crisp', helper: 'Best detail', quality: 0.95 },
   balanced: { label: 'Balanced', helper: 'Everyday', quality: 0.85 },
@@ -130,13 +131,115 @@ const formatBytes = (bytes: number) => {
   return mb >= 1 ? `${mb.toFixed(1)} MB` : `${(bytes / 1024).toFixed(1)} KB`
 }
 
+const isIOS = () => {
+  if (typeof navigator === 'undefined') return false
+  return /iPad|iPhone|iPod/.test(navigator.userAgent) || 
+    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
+}
+
+const isMobile = () => {
+  if (typeof navigator === 'undefined') return false
+  return /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent) ||
+    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
+}
+
+// iOS Safari has strict canvas limits:
+// - ~16 million pixels max per canvas on older devices
+// - ~64 million pixels on newer devices  
+// - We target 12 million to be safe across all iOS devices
+const MAX_CANVAS_PIXELS_IOS = 12_000_000
+const MAX_CANVAS_PIXELS_MOBILE = 24_000_000
+const MAX_CANVAS_PIXELS_DESKTOP = 100_000_000
+
+const getMaxCanvasPixels = () => {
+  if (isIOS()) return MAX_CANVAS_PIXELS_IOS
+  if (isMobile()) return MAX_CANVAS_PIXELS_MOBILE
+  return MAX_CANVAS_PIXELS_DESKTOP
+}
+
+// Calculate safe export scale based on canvas dimensions and device limits
+const getSafeExportScale = (width: number, height: number): number => {
+  const maxPixels = getMaxCanvasPixels()
+  const totalPixels = width * height
+  
+  if (totalPixels <= maxPixels) {
+    return 1
+  }
+  
+  // Calculate scale needed to fit within pixel budget
+  const scale = Math.sqrt(maxPixels / totalPixels)
+  // Round down to nearest 0.05 to be conservative
+  return Math.floor(scale * 20) / 20
+}
+
+const canvasToBlobAsync = (canvas: HTMLCanvasElement, mimeType: string, quality: number): Promise<Blob> => {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob(
+      (blob) => {
+        if (blob) {
+          resolve(blob)
+        } else {
+          reject(new Error('Failed to create blob from canvas'))
+        }
+      },
+      mimeType,
+      quality
+    )
+  })
+}
+
+// Attempt export with automatic retry at lower resolution
+const attemptExport = async (
+  stage: Konva.Stage,
+  fullWidth: number,
+  fullHeight: number,
+  quality: number,
+  onProgress?: (message: string) => void
+): Promise<{ blob: Blob; scale: number }> => {
+  const safeScale = getSafeExportScale(fullWidth, fullHeight)
+  const scales = [safeScale, safeScale * 0.7, safeScale * 0.5, 0.25].filter(s => s > 0.1)
+  
+  let lastError: Error | null = null
+  
+  for (const scale of scales) {
+    const scaledWidth = Math.round(fullWidth * scale)
+    const scaledHeight = Math.round(fullHeight * scale)
+    
+    onProgress?.(`Exporting at ${Math.round(scale * 100)}% resolution...`)
+    
+    try {
+      stage.scale({ x: scale, y: scale })
+      stage.size({ width: scaledWidth, height: scaledHeight })
+      stage.batchDraw()
+      
+      // Small delay to let the browser stabilize
+      await new Promise(resolve => setTimeout(resolve, 100))
+      
+      const canvas = stage.toCanvas() as HTMLCanvasElement
+      const blob = await canvasToBlobAsync(canvas, 'image/jpeg', quality)
+      
+      return { blob, scale }
+    } catch (error) {
+      console.warn(`Export at ${Math.round(scale * 100)}% failed:`, error)
+      lastError = error instanceof Error ? error : new Error('Export failed')
+      
+      // Force cleanup before retry
+      await new Promise(resolve => setTimeout(resolve, 200))
+    }
+  }
+  
+  throw lastError || new Error('Export failed at all resolutions')
+}
+
 const readFileAsAsset = async (file: File, index: number): Promise<PhotoAsset> => {
   const id = `${file.name}-${index}-${Date.now()}`
+  // Use significantly reduced max width on mobile to save memory
+  const maxWidth = isMobile() ? IMPORT_WIDTH_MOBILE : EXPORT_WIDTH
 
   if (supportsImageBitmap) {
     try {
       const bitmap = await createImageBitmap(file)
-      const scale = Math.min(1, EXPORT_WIDTH / bitmap.width)
+      const scale = Math.min(1, maxWidth / bitmap.width)
       const targetWidth = Math.round(bitmap.width * scale)
       const targetHeight = Math.round(bitmap.height * scale)
 
@@ -170,7 +273,7 @@ const readFileAsAsset = async (file: File, index: number): Promise<PhotoAsset> =
   }
 
   const image = await loadImageElement(file)
-  const scale = Math.min(1, EXPORT_WIDTH / image.naturalWidth)
+  const scale = Math.min(1, maxWidth / image.naturalWidth)
   const targetWidth = Math.round(image.naturalWidth * scale)
   const targetHeight = Math.round(image.naturalHeight * scale)
 
@@ -319,31 +422,54 @@ function App() {
     const renderPrivacyNote = (alignment: 'left' | 'right' | 'center' = 'left') => (
       <Typography
         variant="caption"
-        color="rgba(247,247,251,0.72)"
-        sx={{ textAlign: alignment, maxWidth: 320 }}
+        sx={{ 
+          textAlign: alignment, 
+          maxWidth: 280,
+          color: 'rgba(247,247,251,0.5)',
+          fontSize: '0.7rem',
+          lineHeight: 1.4,
+        }}
       >
-        Photos stay on this device—nothing is uploaded or sent anywhere.
+        🔒 Your photos never leave this device
       </Typography>
     )
 
     const renderDropHint = (alignment: 'left' | 'right' | 'center' = 'left') => (
       <Typography
         variant="body2"
-        color="rgba(247,247,251,0.85)"
-        sx={{ textAlign: alignment, maxWidth: 360 }}
+        sx={{ 
+          textAlign: alignment, 
+          maxWidth: 360,
+          color: 'rgba(247,247,251,0.45)',
+          fontSize: '0.8rem',
+          display: { xs: 'none', sm: 'block' },
+        }}
       >
-        or drag and drop images here
+        or drop images anywhere
       </Typography>
     )
 
-    const renderSelectPhotosButton = () => (
+    const renderSelectPhotosButton = (size: 'small' | 'medium' | 'large' = 'medium') => (
       <Button
         component="label"
         variant="contained"
         color="primary"
+        size={size}
         startIcon={<AddPhotoAlternateRoundedIcon />}
+        sx={{
+          borderRadius: 2,
+          textTransform: 'none',
+          fontWeight: 600,
+          px: size === 'large' ? 4 : 3,
+          py: size === 'large' ? 1.5 : 1,
+          fontSize: size === 'large' ? '1rem' : '0.875rem',
+          boxShadow: '0 4px 14px rgba(0,0,0,0.25)',
+          '&:hover': {
+            boxShadow: '0 6px 20px rgba(0,0,0,0.35)',
+          },
+        }}
       >
-        Select Photos
+        {size === 'large' ? 'Choose Photos' : 'Add Photos'}
         <input hidden accept="image/*" multiple type="file" onChange={handleFiles} />
       </Button>
     )
@@ -353,25 +479,39 @@ function App() {
       return
     }
 
-    const selected = incoming.slice(0, MAX_IMAGES)
-    if (incoming.length > MAX_IMAGES) {
-      setSnackbar(`Only the first ${MAX_IMAGES} images were queued.`)
+    const maxImages = isMobile() ? MAX_IMAGES_MOBILE : MAX_IMAGES_DESKTOP
+    const batchSize = isMobile() ? BATCH_SIZE_MOBILE : BATCH_SIZE_DESKTOP
+    
+    const selected = incoming.slice(0, maxImages)
+    if (incoming.length > maxImages) {
+      setSnackbar(`Only the first ${maxImages} images were queued.`)
     }
 
     setIsProcessing(true)
     try {
+      // Dispose existing assets first to free memory
       disposeAssets(assetsRef.current)
+      setAssets([]) // Clear state immediately
+      
+      // Small delay to let garbage collection run
+      await new Promise(resolve => setTimeout(resolve, 100))
+      
       const loaded: PhotoAsset[] = []
       
-      // Batch processing to avoid memory spike
-      for (let i = 0; i < selected.length; i += BATCH_SIZE) {
-        const batch = selected.slice(i, i + BATCH_SIZE)
+      // Batch processing with smaller batches on mobile
+      for (let i = 0; i < selected.length; i += batchSize) {
+        const batch = selected.slice(i, i + batchSize)
         const batchResults = await Promise.all(
           batch.map((file, index) => readFileAsAsset(file, i + index))
         )
         loaded.push(...batchResults)
         // Update UI progressively
         setAssets([...loaded])
+        
+        // Yield to browser between batches on mobile
+        if (isMobile()) {
+          await new Promise(resolve => setTimeout(resolve, 50))
+        }
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unable to process images'
@@ -420,7 +560,7 @@ function App() {
     event.dataTransfer?.clearData()
   }
 
-  const handleDownload = () => {
+  const handleDownload = async () => {
     if (!stageRef.current || !assets.length) {
       setSnackbar('Add photos before exporting your recap.')
       return
@@ -430,20 +570,40 @@ function App() {
     const previousScale = stage.scale()
     const previousSize = stage.size()
 
-    stage.scale({ x: 1, y: 1 })
-    stage.size({ width: fullExportWidth, height: fullStageHeight })
-    stage.batchDraw()
+    setIsProcessing(true)
 
-    const dataUrl = stage.toDataURL({ mimeType: 'image/jpeg', quality: compressionQuality })
+    try {
+      const { blob, scale } = await attemptExport(
+        stage,
+        fullExportWidth,
+        fullStageHeight,
+        compressionQuality,
+        (msg) => console.log(msg)
+      )
 
-    stage.scale(previousScale)
-    stage.size(previousSize)
-    stage.batchDraw()
+      const url = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = url
+      link.download = `onepic-${format(new Date(), 'yyyy-MM-dd')}.jpg`
+      link.click()
 
-    const link = document.createElement('a')
-    link.href = dataUrl
-    link.download = `onepic-${format(new Date(), 'yyyy-MM-dd')}.jpg`
-    link.click()
+      // Clean up blob URL after a short delay
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+
+      if (scale < 0.9) {
+        const pct = Math.round(scale * 100)
+        setSnackbar(`Exported at ${pct}% resolution to fit device memory limits.`)
+      }
+    } catch (error) {
+      console.error('Export failed:', error)
+      setSnackbar('Export failed. Try with fewer photos or lower quality.')
+    } finally {
+      // Restore stage to preview state
+      stage.scale(previousScale)
+      stage.size(previousSize)
+      stage.batchDraw()
+      setIsProcessing(false)
+    }
   }
 
   const resetState = () => {
@@ -459,13 +619,12 @@ function App() {
       component="main"
       sx={{
         minHeight: '100vh',
-        background:
-          'radial-gradient(circle at top, rgba(255,255,255,0.12), transparent 55%), #05060a',
-        py: { xs: 4, md: 6 },
-        pb: { xs: 12, md: 6 },
+        background: 'linear-gradient(180deg, #0a0c10 0%, #05060a 100%)',
+        py: { xs: 2, md: 5 },
+        pb: { xs: 14, md: 6 },
       }}
     >
-      <Container maxWidth="lg">
+      <Container maxWidth="md">
         <Paper
           elevation={0}
           onDragEnter={handleDragEnter}
@@ -473,12 +632,15 @@ function App() {
           onDragOver={handleDragOver}
           onDrop={handleDrop}
           sx={{
-            borderRadius: 4,
-            background: 'rgba(8, 10, 14, 0.75)',
-            border: isDragOver ? '1px solid rgba(144,202,249,0.9)' : '1px solid rgba(255,255,255,0.08)',
-            boxShadow: isDragOver ? '0 0 0 1px rgba(144,202,249,0.4)' : undefined,
+            borderRadius: { xs: 3, md: 4 },
+            background: 'rgba(255, 255, 255, 0.03)',
+            backdropFilter: 'blur(20px)',
+            border: isDragOver ? '1px solid rgba(144,202,249,0.7)' : '1px solid rgba(255,255,255,0.06)',
+            boxShadow: isDragOver 
+              ? '0 0 0 1px rgba(144,202,249,0.3), 0 20px 60px rgba(0,0,0,0.4)' 
+              : '0 20px 60px rgba(0,0,0,0.3)',
             transition: 'border-color 0.2s ease, box-shadow 0.2s ease',
-            p: { xs: 3, md: 4 },
+            p: { xs: 2.5, md: 4 },
             color: '#f7f7fb',
             position: 'relative',
             overflow: 'hidden',
@@ -488,65 +650,85 @@ function App() {
             <Box
               sx={{
                 position: 'absolute',
-                inset: 8,
-                borderRadius: 3,
-                border: '1px dashed rgba(144,202,249,0.9)',
-                background: 'rgba(13, 71, 161, 0.18)',
-                color: '#e3f2fd',
-                fontWeight: 600,
-                letterSpacing: 1,
-                textTransform: 'uppercase',
+                inset: 0,
+                borderRadius: 'inherit',
+                background: 'rgba(13, 71, 161, 0.15)',
+                backdropFilter: 'blur(4px)',
+                color: '#90caf9',
+                fontWeight: 500,
+                fontSize: '1.1rem',
                 display: 'flex',
                 alignItems: 'center',
                 justifyContent: 'center',
                 pointerEvents: 'none',
+                zIndex: 10,
               }}
             >
-              Drop photos to add them
+              Drop to add photos
             </Box>
           )}
           <Stack spacing={3}>
             {hasAssets ? (
-              <Stack direction={{ xs: 'column', md: 'row' }} spacing={{ xs: 2, md: 2 }} justifyContent="space-between">
-                <Box>
-                  <Typography variant="h4" fontWeight={600} gutterBottom sx={{ fontSize: { xs: '1.75rem', md: '2.125rem' } }}>
-                    OnePic
-                  </Typography>
-                  <Typography variant="body2" color="rgba(247,247,251,0.72)" sx={{ display: { xs: 'none', md: 'block' } }}>
-                    Select up to 100 photos, experiment with layouts, and export a single collage.
-                  </Typography>
-                </Box>
-                <Stack spacing={1} alignItems={{ xs: 'stretch', md: 'flex-end' }}>
-                  <Stack direction="row" spacing={1} justifyContent={{ xs: 'space-between', md: 'flex-end' }}>
-                    {renderSelectPhotosButton()}
-                    <Tooltip title="Start over">
-                      <span>
-                        <IconButton 
-                          color="inherit" 
-                          disabled={!assets.length} 
-                          onClick={resetState}
-                          size="small"
-                        >
-                          <RestartAltRoundedIcon />
-                        </IconButton>
-                      </span>
-                    </Tooltip>
-                  </Stack>
-                  {renderPrivacyNote('right')}
-                  {renderDropHint('right')}
+              <Stack direction="row" spacing={2} justifyContent="space-between" alignItems="center">
+                <Typography 
+                  variant="h5" 
+                  fontWeight={700} 
+                  sx={{ 
+                    fontSize: { xs: '1.25rem', md: '1.5rem' },
+                    letterSpacing: '-0.02em',
+                  }}
+                >
+                  OnePic
+                </Typography>
+                <Stack direction="row" spacing={1} alignItems="center">
+                  {renderSelectPhotosButton('small')}
+                  <Tooltip title="Clear all">
+                    <IconButton 
+                      onClick={resetState}
+                      size="small"
+                      sx={{ 
+                        color: 'rgba(247,247,251,0.5)',
+                        '&:hover': { color: 'rgba(247,247,251,0.8)' },
+                      }}
+                    >
+                      <RestartAltRoundedIcon fontSize="small" />
+                    </IconButton>
+                  </Tooltip>
                 </Stack>
               </Stack>
             ) : (
-              <Stack spacing={2.5} alignItems="center" textAlign="center" py={{ xs: 2, md: 4 }}>
-                <Typography variant="h4" fontWeight={600} sx={{ fontSize: { xs: '1.75rem', md: '2.125rem' } }}>
-                  OnePic
-                </Typography>
-                <Typography variant="body1" color="rgba(247,247,251,0.72)" px={{ xs: 2, md: 0 }}>
-                  Turn your photos into a single beautiful collage. All your memories in one pic.
-                </Typography>
-                {renderSelectPhotosButton()}
-                {renderDropHint('center')}
-                {renderPrivacyNote('center')}
+              <Stack spacing={3} alignItems="center" textAlign="center" py={{ xs: 4, md: 6 }}>
+                <Stack spacing={1} alignItems="center">
+                  <Typography 
+                    variant="h3" 
+                    fontWeight={700} 
+                    sx={{ 
+                      fontSize: { xs: '2rem', md: '2.5rem' },
+                      letterSpacing: '-0.03em',
+                      background: 'linear-gradient(135deg, #f7f7fb 0%, rgba(247,247,251,0.7) 100%)',
+                      WebkitBackgroundClip: 'text',
+                      WebkitTextFillColor: 'transparent',
+                    }}
+                  >
+                    OnePic
+                  </Typography>
+                    <Typography 
+                    variant="body1" 
+                    sx={{ 
+                      color: 'rgba(247,247,251,0.55)',
+                      fontSize: { xs: '0.95rem', md: '1.05rem' },
+                      maxWidth: 340,
+                      lineHeight: 1.5,
+                    }}
+                    >
+                    Turn up to 100 photos into one beautiful collage. All processing happens locally.
+                    </Typography>
+                </Stack>
+                {renderSelectPhotosButton('large')}
+                <Stack spacing={0.5} alignItems="center">
+                  {renderDropHint('center')}
+                  {renderPrivacyNote('center')}
+                </Stack>
               </Stack>
             )}
 
@@ -557,15 +739,23 @@ function App() {
                 <Paper
                   elevation={0}
                   sx={{
-                    p: { xs: 2, md: 3 },
-                    borderRadius: 3,
-                    background: 'rgba(255,255,255,0.05)',
-                    border: '1px solid rgba(255,255,255,0.08)',
+                    p: { xs: 2, md: 2.5 },
+                    borderRadius: 2.5,
+                    background: 'rgba(255,255,255,0.02)',
+                    border: '1px solid rgba(255,255,255,0.05)',
                   }}
                 >
-                  <Stack spacing={{ xs: 2.5, md: 3 }} direction={{ xs: 'column', md: 'row' }}>
-                    <Stack spacing={1} flex={1}>
-                      <Typography variant="overline" fontSize="0.7rem" color="rgba(247,247,251,0.72)">
+                  <Stack spacing={{ xs: 2, md: 2.5 }} direction={{ xs: 'column', md: 'row' }}>
+                    <Stack spacing={1.5} flex={1}>
+                      <Typography 
+                        variant="overline" 
+                        sx={{ 
+                          fontSize: '0.65rem', 
+                          color: 'rgba(247,247,251,0.4)',
+                          letterSpacing: '0.1em',
+                          fontWeight: 600,
+                        }}
+                      >
                         Layout
                       </Typography>
                       <ToggleButtonGroup
@@ -578,14 +768,26 @@ function App() {
                             setLayoutMode(value)
                           }
                         }}
+                        sx={{
+                          '& .MuiToggleButton-root': {
+                            fontSize: '0.75rem',
+                            py: 0.5,
+                            px: 1.5,
+                            textTransform: 'none',
+                            fontWeight: 500,
+                          },
+                        }}
                       >
                         <ToggleButton value="masonry">Masonry</ToggleButton>
                         <ToggleButton value="justified">Justified</ToggleButton>
                       </ToggleButtonGroup>
                       {layoutMode === 'masonry' ? (
                         <Box>
-                          <Typography variant="caption" fontSize="0.7rem" color="rgba(247,247,251,0.6)">
-                            Columns: {columns}
+                          <Typography 
+                            variant="caption" 
+                            sx={{ fontSize: '0.7rem', color: 'rgba(247,247,251,0.5)' }}
+                          >
+                            {columns} columns
                           </Typography>
                           <Slider
                             value={columns}
@@ -594,12 +796,16 @@ function App() {
                             step={1}
                             size="small"
                             onChange={(_event, value) => setColumns(value as number)}
+                            sx={{ mt: 0.5 }}
                           />
                         </Box>
                       ) : (
                         <Box>
-                          <Typography variant="caption" fontSize="0.7rem" color="rgba(247,247,251,0.6)">
-                            Row height: {rowHeight}px
+                          <Typography 
+                            variant="caption" 
+                            sx={{ fontSize: '0.7rem', color: 'rgba(247,247,251,0.5)' }}
+                          >
+                            {rowHeight}px rows
                           </Typography>
                           <Slider
                             value={rowHeight}
@@ -608,39 +814,61 @@ function App() {
                             step={20}
                             size="small"
                             onChange={(_event, value) => setRowHeight(value as number)}
+                            sx={{ mt: 0.5 }}
                           />
                         </Box>
                       )}
                     </Stack>
-                    <Divider flexItem orientation="vertical" sx={{ display: { xs: 'none', md: 'block' } }} />
-                    <Stack spacing={1} flex={1}>
-                      <Typography variant="overline" fontSize="0.7rem" color="rgba(247,247,251,0.72)">
-                        Footer
-                      </Typography>
-                      <FormControlLabel
-                        control={
-                          <Switch
-                            size="small"
-                            checked={footerEnabled}
-                            onChange={(_event, checked) => setFooterEnabled(checked)}
-                            color="secondary"
-                          />
-                        }
-                        label={<Typography variant="body2">{footerEnabled ? 'Enabled' : 'Disabled'}</Typography>}
-                      />
+                    <Divider flexItem orientation="vertical" sx={{ display: { xs: 'none', md: 'block' }, borderColor: 'rgba(255,255,255,0.06)' }} />
+                    <Stack spacing={1.5} flex={1}>
+                      <Stack direction="row" alignItems="center" justifyContent="space-between">
+                        <Typography 
+                          variant="overline" 
+                          sx={{ 
+                            fontSize: '0.65rem', 
+                            color: 'rgba(247,247,251,0.4)',
+                            letterSpacing: '0.1em',
+                            fontWeight: 600,
+                          }}
+                        >
+                          Caption
+                        </Typography>
+                        <Switch
+                          size="small"
+                          checked={footerEnabled}
+                          onChange={(_event, checked) => setFooterEnabled(checked)}
+                          color="secondary"
+                        />
+                      </Stack>
                       <TextField
                         size="small"
-                        label="Footer text"
-                        placeholder="Add a title or date"
+                        placeholder="Add a title or date..."
                         disabled={!footerEnabled}
                         value={footerText}
                         onChange={(event) => setFooterText(event.target.value)}
-                        InputProps={{ sx: { color: '#f7f7fb' } }}
+                        sx={{
+                          '& .MuiOutlinedInput-root': {
+                            fontSize: '0.85rem',
+                            color: '#f7f7fb',
+                            '& fieldset': { borderColor: 'rgba(255,255,255,0.1)' },
+                            '&:hover fieldset': { borderColor: 'rgba(255,255,255,0.2)' },
+                            '&.Mui-focused fieldset': { borderColor: 'rgba(255,193,7,0.5)' },
+                            '&.Mui-disabled': { opacity: 0.4 },
+                          },
+                        }}
                       />
                     </Stack>
-                    <Divider flexItem orientation="vertical" sx={{ display: { xs: 'none', md: 'block' } }} />
-                    <Stack spacing={1} flex={1}>
-                      <Typography variant="overline" fontSize="0.7rem" color="rgba(247,247,251,0.72)">
+                    <Divider flexItem orientation="vertical" sx={{ display: { xs: 'none', md: 'block' }, borderColor: 'rgba(255,255,255,0.06)' }} />
+                    <Stack spacing={1.5} flex={1}>
+                      <Typography 
+                        variant="overline" 
+                        sx={{ 
+                          fontSize: '0.65rem', 
+                          color: 'rgba(247,247,251,0.4)',
+                          letterSpacing: '0.1em',
+                          fontWeight: 600,
+                        }}
+                      >
                         Quality
                       </Typography>
                       <ToggleButtonGroup
@@ -653,6 +881,15 @@ function App() {
                             setCompressionPreset(value)
                           }
                         }}
+                        sx={{
+                          '& .MuiToggleButton-root': {
+                            fontSize: '0.75rem',
+                            py: 0.5,
+                            px: 1.5,
+                            textTransform: 'none',
+                            fontWeight: 500,
+                          },
+                        }}
                       >
                         {Object.entries(compressionPresets).map(([key, option]) => (
                           <ToggleButton key={key} value={key}>
@@ -660,20 +897,33 @@ function App() {
                           </ToggleButton>
                         ))}
                       </ToggleButtonGroup>
-                      <Typography variant="caption" fontSize="0.7rem" color="rgba(247,247,251,0.6)">
-                        {Math.round(compressionQuality * 100)}% · {compressionPresets[compressionPreset].helper}
+                      <Typography 
+                        variant="caption" 
+                        sx={{ fontSize: '0.7rem', color: 'rgba(247,247,251,0.5)' }}
+                      >
+                        {compressionPresets[compressionPreset].helper}
                       </Typography>
                     </Stack>
                   </Stack>
                 </Paper>
 
-                <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.5} alignItems="center" flexWrap="wrap">
-                  <Chip label={`${assets.length} photo${assets.length === 1 ? '' : 's'}`} color="secondary" size="small" />
-                  <Chip 
-                    label={`${estimatedSizeLabel} · ${Math.round(compressionQuality * 100)}% quality`} 
-                    variant="outlined" 
-                    size="small"
-                  />
+                <Stack 
+                  direction="row" 
+                  spacing={1} 
+                  alignItems="center" 
+                  sx={{ 
+                    py: 0.5,
+                    color: 'rgba(247,247,251,0.5)',
+                    fontSize: '0.8rem',
+                  }}
+                >
+                  <Typography variant="body2" sx={{ fontWeight: 500, color: 'rgba(247,247,251,0.7)' }}>
+                    {assets.length} photo{assets.length === 1 ? '' : 's'}
+                  </Typography>
+                  <Typography variant="body2" sx={{ color: 'rgba(247,247,251,0.3)' }}>•</Typography>
+                  <Typography variant="body2">
+                    {estimatedSizeLabel}
+                  </Typography>
                 </Stack>
 
                 <Box
@@ -681,10 +931,10 @@ function App() {
                   sx={{
                     width: '100%',
                     overflowX: 'auto',
-                    borderRadius: 3,
-                    border: '1px dashed rgba(255,255,255,0.24)',
-                    background: 'rgba(5,6,10,0.65)',
-                    p: 2,
+                    borderRadius: 2,
+                    border: '1px solid rgba(255,255,255,0.06)',
+                    background: 'rgba(0,0,0,0.2)',
+                    p: { xs: 1.5, md: 2 },
                   }}
                 >
                   <Box
@@ -773,25 +1023,25 @@ function App() {
           onClick={handleDownload}
           sx={{
             position: 'fixed',
-            bottom: { xs: 24, md: 40 },
-            right: { xs: 24, md: 40 },
+            bottom: { xs: 20, md: 32 },
+            right: { xs: '50%', md: 32 },
+            transform: { xs: 'translateX(50%)', md: 'none' },
             zIndex: 1000,
-            px: { xs: 4, md: 5 },
-            py: { xs: 2, md: 2.5 },
-            fontSize: { xs: '1.125rem', md: '1.25rem' },
-            fontWeight: 700,
+            px: { xs: 3, md: 4 },
+            py: { xs: 1.25, md: 1.5 },
+            fontSize: { xs: '0.95rem', md: '1rem' },
+            fontWeight: 600,
             textTransform: 'none',
-            minWidth: { xs: 160, md: 200 },
-            boxShadow: '0 12px 48px rgba(0,0,0,0.6)',
-            border: '2px solid rgba(255,255,255,0.1)',
+            borderRadius: 3,
+            boxShadow: '0 8px 32px rgba(0,0,0,0.5)',
             '&:hover': {
-              transform: 'translateY(-3px) scale(1.02)',
-              boxShadow: '0 16px 64px rgba(0,0,0,0.7)',
+              transform: { xs: 'translateX(50%) translateY(-2px)', md: 'translateY(-2px)' },
+              boxShadow: '0 12px 40px rgba(0,0,0,0.6)',
             },
-            transition: 'all 0.25s cubic-bezier(0.4, 0, 0.2, 1)',
+            transition: 'all 0.2s ease',
           }}
         >
-          <DownloadRoundedIcon sx={{ mr: 1.5, fontSize: { xs: '1.5rem', md: '1.75rem' } }} />
+          <DownloadRoundedIcon sx={{ mr: 1, fontSize: '1.25rem' }} />
           Save Image
         </Fab>
       )}
@@ -801,22 +1051,27 @@ function App() {
         component="footer"
         sx={{
           textAlign: 'center',
-          py: 3,
-          color: 'rgba(247,247,251,0.5)',
+          py: 4,
+          mt: 2,
         }}
       >
-        <Typography variant="caption">
-          Built by{' '}
+        <Typography 
+          variant="caption" 
+          sx={{ 
+            color: 'rgba(247,247,251,0.3)',
+            fontSize: '0.7rem',
+          }}
+        >
+          Made by{' '}
           <Link
             href="https://emanuele.click/"
             target="_blank"
             rel="noopener noreferrer"
             sx={{
-              color: 'rgba(144,202,249,0.8)',
+              color: 'rgba(247,247,251,0.4)',
               textDecoration: 'none',
               '&:hover': {
-                color: 'rgba(144,202,249,1)',
-                textDecoration: 'underline',
+                color: 'rgba(247,247,251,0.6)',
               },
             }}
           >
@@ -825,10 +1080,20 @@ function App() {
         </Typography>
       </Box>
 
-      <Backdrop open={isProcessing} sx={{ zIndex: (theme) => theme.zIndex.modal + 1, color: '#fff' }}>
+      <Backdrop 
+        open={isProcessing} 
+        sx={{ 
+          zIndex: (theme) => theme.zIndex.modal + 1, 
+          color: '#fff',
+          backdropFilter: 'blur(8px)',
+          background: 'rgba(5,6,10,0.85)',
+        }}
+      >
         <Stack spacing={2} alignItems="center">
-          <LinearProgress sx={{ width: 200 }} />
-          <Typography variant="body2">Processing originals…</Typography>
+          <LinearProgress sx={{ width: 180, borderRadius: 1 }} color="secondary" />
+          <Typography variant="body2" sx={{ color: 'rgba(247,247,251,0.7)', fontSize: '0.85rem' }}>
+            Processing photos…
+          </Typography>
         </Stack>
       </Backdrop>
 
