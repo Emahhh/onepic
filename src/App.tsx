@@ -10,9 +10,11 @@ import {
   Chip,
   Container,
   Divider,
+  Fab,
   FormControlLabel,
   IconButton,
   LinearProgress,
+  Link,
   Paper,
   Slider,
   Snackbar,
@@ -27,11 +29,18 @@ import {
 import AddPhotoAlternateRoundedIcon from '@mui/icons-material/AddPhotoAlternateRounded'
 import DownloadRoundedIcon from '@mui/icons-material/DownloadRounded'
 import RestartAltRoundedIcon from '@mui/icons-material/RestartAltRounded'
-import InfoOutlinedIcon from '@mui/icons-material/InfoOutlined'
 import { format } from 'date-fns'
 import { useResizeObserver } from './hooks/useResizeObserver'
 import { computeJustifiedLayout, computeMasonryLayout } from './layouts'
 import type { LayoutItem, LayoutMode } from './layouts'
+
+const debounce = <T extends (...args: any[]) => any>(fn: T, delay: number) => {
+  let timeoutId: ReturnType<typeof setTimeout> | null = null
+  return ((...args: Parameters<T>) => {
+    if (timeoutId) clearTimeout(timeoutId)
+    timeoutId = setTimeout(() => fn(...args), delay)
+  }) as T
+}
 
 const MAX_IMAGES = 100
 const EXPORT_WIDTH = 3600
@@ -39,7 +48,8 @@ const DEFAULT_ROW_HEIGHT = 340
 const DEFAULT_GUTTER = 32
 const FOOTER_HEIGHT = 240
 const FRAME_PADDING = 48
-const PREVIEW_MAX_WIDTH = 1400
+const PREVIEW_MAX_WIDTH = 600
+const BATCH_SIZE = 8
 const compressionPresets = {
   crisp: { label: 'Crisp', helper: 'Best detail', quality: 0.95 },
   balanced: { label: 'Balanced', helper: 'Everyday', quality: 0.85 },
@@ -197,6 +207,8 @@ function App() {
   const [estimatedSize, setEstimatedSize] = useState<number | null>(null)
   const [isEstimating, setIsEstimating] = useState(false)
   const [isDragOver, setIsDragOver] = useState(false)
+  const [debouncedColumns, setDebouncedColumns] = useState(4)
+  const [debouncedRowHeight, setDebouncedRowHeight] = useState(DEFAULT_ROW_HEIGHT)
 
   const { ref: previewRef, size: previewSize } = useResizeObserver<HTMLDivElement>()
   const stageRef = useRef<Konva.Stage>(null)
@@ -221,6 +233,17 @@ function App() {
     Konva.pixelRatio = Math.min(window.devicePixelRatio || 1, 1.5)
   }, [])
 
+  // Debounce slider changes
+  useEffect(() => {
+    const handler = debounce(() => setDebouncedColumns(columns), 300)
+    handler()
+  }, [columns])
+
+  useEffect(() => {
+    const handler = debounce(() => setDebouncedRowHeight(rowHeight), 300)
+    handler()
+  }, [rowHeight])
+
 
   const layout = useMemo(() => {
     if (!assets.length) {
@@ -228,9 +251,9 @@ function App() {
     }
 
     return layoutMode === 'masonry'
-      ? computeMasonryLayout(assets, { columns, gutter: DEFAULT_GUTTER, width: EXPORT_WIDTH })
-      : computeJustifiedLayout(assets, { rowHeight, gutter: DEFAULT_GUTTER, width: EXPORT_WIDTH })
-  }, [assets, columns, layoutMode, rowHeight])
+      ? computeMasonryLayout(assets, { columns: debouncedColumns, gutter: DEFAULT_GUTTER, width: EXPORT_WIDTH })
+      : computeJustifiedLayout(assets, { rowHeight: debouncedRowHeight, gutter: DEFAULT_GUTTER, width: EXPORT_WIDTH })
+  }, [assets, debouncedColumns, layoutMode, debouncedRowHeight])
 
   const collageHeight = layout.height + (footerEnabled ? FOOTER_HEIGHT : 0)
   const fullExportWidth = EXPORT_WIDTH + FRAME_PADDING * 2
@@ -252,6 +275,7 @@ function App() {
 
     let cancelled = false
     setIsEstimating(true)
+    // Heavy debounce for size estimation (3 seconds)
     const timeout = window.setTimeout(() => {
       if (!stageRef.current || cancelled) {
         return
@@ -275,7 +299,7 @@ function App() {
           setIsEstimating(false)
         }
       }
-    }, 600)
+    }, 3000)
 
     return () => {
       cancelled = true
@@ -336,9 +360,19 @@ function App() {
 
     setIsProcessing(true)
     try {
-      const loaded = await Promise.all(selected.map((file, index) => readFileAsAsset(file, index)))
       disposeAssets(assetsRef.current)
-      setAssets(loaded)
+      const loaded: PhotoAsset[] = []
+      
+      // Batch processing to avoid memory spike
+      for (let i = 0; i < selected.length; i += BATCH_SIZE) {
+        const batch = selected.slice(i, i + BATCH_SIZE)
+        const batchResults = await Promise.all(
+          batch.map((file, index) => readFileAsAsset(file, i + index))
+        )
+        loaded.push(...batchResults)
+        // Update UI progressively
+        setAssets([...loaded])
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unable to process images'
       setSnackbar(message)
@@ -428,6 +462,7 @@ function App() {
         background:
           'radial-gradient(circle at top, rgba(255,255,255,0.12), transparent 55%), #05060a',
         py: { xs: 4, md: 6 },
+        pb: { xs: 12, md: 6 },
       }}
     >
       <Container maxWidth="lg">
@@ -439,7 +474,6 @@ function App() {
           onDrop={handleDrop}
           sx={{
             borderRadius: 4,
-            backdropFilter: 'blur(20px)',
             background: 'rgba(8, 10, 14, 0.75)',
             border: isDragOver ? '1px solid rgba(144,202,249,0.9)' : '1px solid rgba(255,255,255,0.08)',
             boxShadow: isDragOver ? '0 0 0 1px rgba(144,202,249,0.4)' : undefined,
@@ -473,21 +507,26 @@ function App() {
           )}
           <Stack spacing={3}>
             {hasAssets ? (
-              <Stack direction={{ xs: 'column', md: 'row' }} spacing={2} justifyContent="space-between">
+              <Stack direction={{ xs: 'column', md: 'row' }} spacing={{ xs: 2, md: 2 }} justifyContent="space-between">
                 <Box>
-                  <Typography variant="h3" fontWeight={600} gutterBottom>
+                  <Typography variant="h4" fontWeight={600} gutterBottom sx={{ fontSize: { xs: '1.75rem', md: '2.125rem' } }}>
                     OnePic
                   </Typography>
-                  <Typography variant="body1" color="rgba(247,247,251,0.72)">
+                  <Typography variant="body2" color="rgba(247,247,251,0.72)" sx={{ display: { xs: 'none', md: 'block' } }}>
                     Select up to 100 photos, experiment with layouts, and export a single collage.
                   </Typography>
                 </Box>
-                <Stack spacing={1} alignItems={{ xs: 'flex-start', md: 'flex-end' }}>
-                  <Stack direction="row" spacing={1} justifyContent="flex-end">
+                <Stack spacing={1} alignItems={{ xs: 'stretch', md: 'flex-end' }}>
+                  <Stack direction="row" spacing={1} justifyContent={{ xs: 'space-between', md: 'flex-end' }}>
                     {renderSelectPhotosButton()}
-                    <Tooltip title="Clear canvas">
+                    <Tooltip title="Start over">
                       <span>
-                        <IconButton color="inherit" disabled={!assets.length} onClick={resetState}>
+                        <IconButton 
+                          color="inherit" 
+                          disabled={!assets.length} 
+                          onClick={resetState}
+                          size="small"
+                        >
                           <RestartAltRoundedIcon />
                         </IconButton>
                       </span>
@@ -498,12 +537,12 @@ function App() {
                 </Stack>
               </Stack>
             ) : (
-              <Stack spacing={2} alignItems="center" textAlign="center">
-                <Typography variant="h3" fontWeight={600}>
+              <Stack spacing={2.5} alignItems="center" textAlign="center" py={{ xs: 2, md: 4 }}>
+                <Typography variant="h4" fontWeight={600} sx={{ fontSize: { xs: '1.75rem', md: '2.125rem' } }}>
                   OnePic
                 </Typography>
-                <Typography variant="body1" color="rgba(247,247,251,0.72)">
-                  Select up to 100 photos and turn them into a single beautiful collage with your memories. All in one pic.
+                <Typography variant="body1" color="rgba(247,247,251,0.72)" px={{ xs: 2, md: 0 }}>
+                  Turn your photos into a single beautiful collage. All your memories in one pic.
                 </Typography>
                 {renderSelectPhotosButton()}
                 {renderDropHint('center')}
@@ -518,15 +557,15 @@ function App() {
                 <Paper
                   elevation={0}
                   sx={{
-                    p: 3,
+                    p: { xs: 2, md: 3 },
                     borderRadius: 3,
                     background: 'rgba(255,255,255,0.05)',
                     border: '1px solid rgba(255,255,255,0.08)',
                   }}
                 >
-                  <Stack spacing={3} direction={{ xs: 'column', md: 'row' }}>
+                  <Stack spacing={{ xs: 2.5, md: 3 }} direction={{ xs: 'column', md: 'row' }}>
                     <Stack spacing={1} flex={1}>
-                      <Typography variant="overline" color="rgba(247,247,251,0.72)">
+                      <Typography variant="overline" fontSize="0.7rem" color="rgba(247,247,251,0.72)">
                         Layout
                       </Typography>
                       <ToggleButtonGroup
@@ -545,7 +584,7 @@ function App() {
                       </ToggleButtonGroup>
                       {layoutMode === 'masonry' ? (
                         <Box>
-                          <Typography variant="caption" color="rgba(247,247,251,0.6)">
+                          <Typography variant="caption" fontSize="0.7rem" color="rgba(247,247,251,0.6)">
                             Columns: {columns}
                           </Typography>
                           <Slider
@@ -553,21 +592,21 @@ function App() {
                             min={2}
                             max={6}
                             step={1}
-                            marks
+                            size="small"
                             onChange={(_event, value) => setColumns(value as number)}
                           />
                         </Box>
                       ) : (
                         <Box>
-                          <Typography variant="caption" color="rgba(247,247,251,0.6)">
-                            Target row height: {rowHeight}px
+                          <Typography variant="caption" fontSize="0.7rem" color="rgba(247,247,251,0.6)">
+                            Row height: {rowHeight}px
                           </Typography>
                           <Slider
                             value={rowHeight}
                             min={220}
                             max={480}
                             step={20}
-                            marks
+                            size="small"
                             onChange={(_event, value) => setRowHeight(value as number)}
                           />
                         </Box>
@@ -575,20 +614,22 @@ function App() {
                     </Stack>
                     <Divider flexItem orientation="vertical" sx={{ display: { xs: 'none', md: 'block' } }} />
                     <Stack spacing={1} flex={1}>
-                      <Typography variant="overline" color="rgba(247,247,251,0.72)">
-                        Polaroid footer
+                      <Typography variant="overline" fontSize="0.7rem" color="rgba(247,247,251,0.72)">
+                        Footer
                       </Typography>
                       <FormControlLabel
                         control={
                           <Switch
+                            size="small"
                             checked={footerEnabled}
                             onChange={(_event, checked) => setFooterEnabled(checked)}
                             color="secondary"
                           />
                         }
-                        label={footerEnabled ? 'Footer enabled' : 'Footer hidden'}
+                        label={<Typography variant="body2">{footerEnabled ? 'Enabled' : 'Disabled'}</Typography>}
                       />
                       <TextField
+                        size="small"
                         label="Footer text"
                         placeholder="Add a title or date"
                         disabled={!footerEnabled}
@@ -599,8 +640,8 @@ function App() {
                     </Stack>
                     <Divider flexItem orientation="vertical" sx={{ display: { xs: 'none', md: 'block' } }} />
                     <Stack spacing={1} flex={1}>
-                      <Typography variant="overline" color="rgba(247,247,251,0.72)">
-                        Compression
+                      <Typography variant="overline" fontSize="0.7rem" color="rgba(247,247,251,0.72)">
+                        Quality
                       </Typography>
                       <ToggleButtonGroup
                         exclusive
@@ -619,41 +660,20 @@ function App() {
                           </ToggleButton>
                         ))}
                       </ToggleButtonGroup>
-                      <Typography variant="caption" color="rgba(247,247,251,0.6)">
-                        Quality {Math.round(compressionQuality * 100)}% · {compressionPresets[compressionPreset].helper}
+                      <Typography variant="caption" fontSize="0.7rem" color="rgba(247,247,251,0.6)">
+                        {Math.round(compressionQuality * 100)}% · {compressionPresets[compressionPreset].helper}
                       </Typography>
                     </Stack>
                   </Stack>
                 </Paper>
 
-                <Stack direction={{ xs: 'column', md: 'row' }} spacing={2} alignItems="center">
-                  <Chip label={`${assets.length} photo${assets.length === 1 ? '' : 's'}`} color="secondary" />
-                  <Chip label={`Export: ${fullExportWidth.toLocaleString()}px wide`} variant="outlined" />
-                  {assets.length > 0 && (
-                    <Chip
-                      variant="outlined"
-                      label={`Approx height: ${Math.round(fullStageHeight)}px`}
-                      icon={<InfoOutlinedIcon />}
-                    />
-                  )}
-                  <Box sx={{ flexGrow: 1 }} />
-                  <Stack spacing={0.5} alignItems={{ xs: 'flex-start', md: 'flex-end' }}>
-                    <Typography variant="caption" color="rgba(247,247,251,0.72)">
-                      Estimated size: {estimatedSizeLabel}
-                    </Typography>
-                    <Typography variant="caption" color="rgba(247,247,251,0.6)">
-                      JPEG quality {Math.round(compressionQuality * 100)}%
-                    </Typography>
-                  </Stack>
-                  <Button
-                    variant="contained"
-                    color="secondary"
-                    disabled={!assets.length}
-                    startIcon={<DownloadRoundedIcon />}
-                    onClick={handleDownload}
-                  >
-                    Download JPEG
-                  </Button>
+                <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.5} alignItems="center" flexWrap="wrap">
+                  <Chip label={`${assets.length} photo${assets.length === 1 ? '' : 's'}`} color="secondary" size="small" />
+                  <Chip 
+                    label={`${estimatedSizeLabel} · ${Math.round(compressionQuality * 100)}% quality`} 
+                    variant="outlined" 
+                    size="small"
+                  />
                 </Stack>
 
                 <Box
@@ -670,7 +690,6 @@ function App() {
                   <Box
                     sx={{
                       width: previewCanvasWidth,
-                      boxShadow: '0 40px 120px rgba(0,0,0,0.45)',
                       backgroundColor: '#fff',
                       borderRadius: 0,
                       mx: 'auto',
@@ -693,9 +712,6 @@ function App() {
                           fill="#ffffffff"
                           stroke="rgba(12,12,16,0.08)"
                           strokeWidth={8}
-                          shadowColor="rgba(0,0,0,0.18)"
-                          shadowBlur={120}
-                          shadowOffsetY={24}
                         />
                       </Layer>
                       <Layer listening={false} perfectDrawEnabled={false}>
@@ -714,8 +730,6 @@ function App() {
                               width={item.width}
                               height={item.height}
                               listening={false}
-                              shadowColor="rgba(0,0,0,0.25)"
-                              shadowBlur={30}
                             />
                           )
                         })}
@@ -750,6 +764,66 @@ function App() {
           </Stack>
         </Paper>
       </Container>
+
+      {/* Floating Download Button */}
+      {hasAssets && (
+        <Fab
+          variant="extended"
+          color="secondary"
+          onClick={handleDownload}
+          sx={{
+            position: 'fixed',
+            bottom: { xs: 24, md: 40 },
+            right: { xs: 24, md: 40 },
+            zIndex: 1000,
+            px: { xs: 4, md: 5 },
+            py: { xs: 2, md: 2.5 },
+            fontSize: { xs: '1.125rem', md: '1.25rem' },
+            fontWeight: 700,
+            textTransform: 'none',
+            minWidth: { xs: 160, md: 200 },
+            boxShadow: '0 12px 48px rgba(0,0,0,0.6)',
+            border: '2px solid rgba(255,255,255,0.1)',
+            '&:hover': {
+              transform: 'translateY(-3px) scale(1.02)',
+              boxShadow: '0 16px 64px rgba(0,0,0,0.7)',
+            },
+            transition: 'all 0.25s cubic-bezier(0.4, 0, 0.2, 1)',
+          }}
+        >
+          <DownloadRoundedIcon sx={{ mr: 1.5, fontSize: { xs: '1.5rem', md: '1.75rem' } }} />
+          Save Image
+        </Fab>
+      )}
+
+      {/* Credit Footer */}
+      <Box
+        component="footer"
+        sx={{
+          textAlign: 'center',
+          py: 3,
+          color: 'rgba(247,247,251,0.5)',
+        }}
+      >
+        <Typography variant="caption">
+          Built by{' '}
+          <Link
+            href="https://emanuele.click/"
+            target="_blank"
+            rel="noopener noreferrer"
+            sx={{
+              color: 'rgba(144,202,249,0.8)',
+              textDecoration: 'none',
+              '&:hover': {
+                color: 'rgba(144,202,249,1)',
+                textDecoration: 'underline',
+              },
+            }}
+          >
+            emanuele.click
+          </Link>
+        </Typography>
+      </Box>
 
       <Backdrop open={isProcessing} sx={{ zIndex: (theme) => theme.zIndex.modal + 1, color: '#fff' }}>
         <Stack spacing={2} alignItems="center">
